@@ -1,0 +1,263 @@
+const http = require("http");
+const fs = require("fs");
+const path = require("path");
+const { URL } = require("url");
+
+const PORT = process.env.PORT || 3000;
+const API_KEY = process.env.TWELVE_DATA_API_KEY;
+
+function send(res, status, body, type = "application/json; charset=utf-8") {
+  res.writeHead(status, {
+    "Content-Type": type,
+    "Cache-Control": "no-store"
+  });
+  res.end(body);
+}
+
+function json(res, status, obj) {
+  send(res, status, JSON.stringify(obj));
+}
+
+function ema(values, period) {
+  if (values.length < period) return null;
+
+  const k = 2 / (period + 1);
+  let e = values.slice(0, period).reduce((a, b) => a + b, 0) / period;
+
+  for (let i = period; i < values.length; i++) {
+    e = values[i] * k + e * (1 - k);
+  }
+
+  return e;
+}
+
+function rsi(values, period = 14) {
+  if (values.length <= period) return null;
+
+  let gain = 0;
+  let loss = 0;
+
+  for (let i = 1; i <= period; i++) {
+    const d = values[i] - values[i - 1];
+
+    if (d >= 0) gain += d;
+    else loss -= d;
+  }
+
+  let avgGain = gain / period;
+  let avgLoss = loss / period;
+
+  for (let i = period + 1; i < values.length; i++) {
+    const d = values[i] - values[i - 1];
+    const g = Math.max(d, 0);
+    const l = Math.max(-d, 0);
+
+    avgGain = (avgGain * (period - 1) + g) / period;
+    avgLoss = (avgLoss * (period - 1) + l) / period;
+  }
+
+  if (avgLoss === 0) return 100;
+
+  return 100 - (100 / (1 + avgGain / avgLoss));
+}
+
+function macd(values) {
+  const fast = ema(values, 12);
+  const slow = ema(values, 26);
+
+  if (fast === null || slow === null) return null;
+
+  return fast - slow;
+}
+
+async function getData(symbol, interval) {
+  if (!API_KEY) {
+    throw new Error(
+      "TWELVE_DATA_API_KEY is not set in Railway Variables"
+    );
+  }
+
+  const u = new URL(
+    "https://api.twelvedata.com/time_series"
+  );
+
+  u.searchParams.set("symbol", symbol);
+  u.searchParams.set("interval", interval);
+  u.searchParams.set("outputsize", "60");
+  u.searchParams.set("format", "JSON");
+  u.searchParams.set("apikey", API_KEY);
+
+  const response = await fetch(u);
+  const text = await response.text();
+
+  let data;
+
+  try {
+    data = JSON.parse(text);
+  } catch {
+    throw new Error(
+      "Twelve Data returned non-JSON response"
+    );
+  }
+
+  if (!response.ok || data.status === "error" || data.code) {
+    throw new Error(
+      data.message || ("Twelve Data HTTP " + response.status)
+    );
+  }
+
+  if (!Array.isArray(data.values) || data.values.length < 30) {
+    throw new Error(
+      "Not enough candle data returned by Twelve Data"
+    );
+  }
+
+  return data.values;
+}
+
+async function apiCandles(req, res, url) {
+  try {
+    const symbol =
+      url.searchParams.get("symbol") || "EUR/USD";
+
+    const interval =
+      url.searchParams.get("interval") || "1min";
+
+    if (!/^(1min|5min|15min)$/.test(interval)) {
+      return json(res, 400, {
+        error: "Invalid interval"
+      });
+    }
+
+    if (!/^[A-Z]{3}\/[A-Z]{3}$/.test(symbol)) {
+      return json(res, 400, {
+        error: "Invalid symbol"
+      });
+    }
+
+    const rows = await getData(symbol, interval);
+
+    const ordered = rows.slice().reverse();
+
+    const closes = ordered
+      .map(x => Number(x.close))
+      .filter(Number.isFinite);
+
+    if (closes.length < 30) {
+      throw new Error(
+        "Not enough valid close prices"
+      );
+    }
+
+    const price = closes[closes.length - 1];
+
+    const ema9 = ema(closes, 9);
+    const ema21 = ema(closes, 21);
+    const rsiValue = rsi(closes, 14);
+    const macdValue = macd(closes);
+
+    let signal = "WAIT";
+
+    if (
+      ema9 !== null &&
+      ema21 !== null &&
+      rsiValue !== null &&
+      macdValue !== null
+    ) {
+      if (
+        ema9 > ema21 &&
+        rsiValue >= 52 &&
+        rsiValue <= 70 &&
+        macdValue > 0
+      ) {
+        signal = "BUY";
+      } else if (
+        ema9 < ema21 &&
+        rsiValue <= 48 &&
+        rsiValue >= 30 &&
+        macdValue < 0
+      ) {
+        signal = "SELL";
+      }
+    }
+
+    const trend =
+      ema9 > ema21
+        ? "UP"
+        : ema9 < ema21
+        ? "DOWN"
+        : "FLAT";
+
+    return json(res, 200, {
+      signal: signal,
+      price: price,
+      trend: trend,
+      rsi: rsiValue,
+      macd: macdValue,
+      time:
+        rows[0].datetime ||
+        new Date().toISOString()
+    });
+
+  } catch (error) {
+    return json(res, 502, {
+      error:
+        error.message ||
+        "Market data request failed"
+    });
+  }
+}
+
+const server = http.createServer(
+  async (req, res) => {
+
+    const url = new URL(
+      req.url,
+      `http://${req.headers.host || "localhost"}`
+    );
+
+    if (url.pathname === "/api/candles") {
+      return apiCandles(req, res, url);
+    }
+
+    if (
+      url.pathname === "/" ||
+      url.pathname === "/index.html"
+    ) {
+      try {
+        const html = fs.readFileSync(
+          path.join(__dirname, "index.html"),
+          "utf8"
+        );
+
+        return send(
+          res,
+          200,
+          html,
+          "text/html; charset=utf-8"
+        );
+
+      } catch (error) {
+        return send(
+          res,
+          500,
+          "index.html missing",
+          "text/plain"
+        );
+      }
+    }
+
+    return send(
+      res,
+      404,
+      "Not found",
+      "text/plain"
+    );
+  }
+);
+
+server.listen(PORT, () => {
+  console.log(
+    `Qotex Signal Bot listening on ${PORT}`
+  );
+});
